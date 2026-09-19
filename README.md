@@ -4,6 +4,24 @@
 
 参考文档：[Anthropic SDK - MiniMax 开放平台文档](https://platform.minimax.cn/docs/api-reference/text-anthropic-api)
 
+## 部署信息
+
+| 项 | 值 |
+|---|---|
+| 服务器公网 IP | `47.121.29.106` |
+| 应用访问 | `http://47.121.29.106:8000` |
+| 健康检查 | `http://47.121.29.106:8000/healthz` |
+| MongoDB 监听 | `47.121.29.106:27017`（主机端口 27017 已暴露到容器外） |
+| 数据库 | `minimax_demo` / 集合 `conversations` |
+| Mongo 用户 | `minimax_admin` |
+| Mongo 密码 | 见服务器 `.env` 文件中的 `MONGO_PASS`（**不入库**） |
+
+完整 MongoDB 连接 URI（生产部署版本）：
+
+```
+mongodb://minimax_admin:<MONGO_PASS>@47.121.29.106:27017/minimax_demo?authSource=admin
+```
+
 ## 功能
 
 - FastAPI 服务，监听 `0.0.0.0:8000`
@@ -189,3 +207,42 @@ curl "http://localhost:8000/history?limit=10"
 - MongoDB 不可达时，`/hello` 仍能正常工作，只是不持久化、不返回 `persisted_id`
 - API key 与 Mongo 密码都只保存在本地 `.env`，请勿提交到 git
 - 如果遇到 MiniMax API 问题，可联系 `Model@minimaxi.com` 或在 [MiniMax-M2 GitHub 仓库](https://github.com/MiniMax-AI/MiniMax-M2/issues) 提 issue
+
+## 测试
+
+仓库自带一个 MongoDB 烟雾测试脚本，使用同步 `pymongo` 驱动，验证"连得上 → 能写 → 能查 → 能清理"。
+
+```bash
+# 1) 安装依赖（如果还没装）
+pip install -r requirements.txt
+
+# 2) 确保 .env 里有 MONGO_PASS（或显式 export）
+python3 tests/test_mongo.py
+```
+
+脚本会：
+1. 用 `MONGO_URL`（默认指向 `47.121.29.106` 这台部署实例）打开认证连接
+2. `ping` 数据库
+3. 在 `smoke_test` 集合插入一条带 UUID marker 的文档
+4. 按 marker 查回该文档
+5. 统计 `smoke_test` 集合文档数
+6. 删除刚插入的 marker 文档（集合保持干净，可重复运行）
+
+预期输出（实际部署验证通过）：
+
+```
+[2026-09-19T03:04:46+00:00] connecting to mongodb://***@47.121.29.106:27017/...
+[2026-09-19T03:04:46+00:00] ping ok: {'ok': 1.0}
+[2026-09-19T03:04:46+00:00] insert ok: _id=... marker=smoke-...
+[2026-09-19T03:04:46+00:00] read ok: marker=... created_at=...
+[2026-09-19T03:04:46+00:00] count ok: smoke_test now has 1 docs total
+[2026-09-19T03:04:46+00:00] cleanup ok: removed 1 doc(s) with marker=...
+[2026-09-19T03:04:46+00:00] ALL CHECKS PASSED ✓
+```
+
+要测试其他实例：
+
+```bash
+export MONGO_URL='mongodb://USER:PASS@host:27017/dbname?authSource=admin'
+python3 tests/test_mongo.py
+```
