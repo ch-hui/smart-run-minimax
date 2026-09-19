@@ -21,6 +21,11 @@ services:
       - ./data/mongo:/data/db
       # Optional: seed scripts on first boot (skipped if dir is empty).
       - ./mongo-init:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Expose mongo to the host so local clients (mongosh / Compass / pymongo)
+      # can reach it via localhost:27017. Change MONGO_HOST_PORT if 27017 is
+      # already taken on the host.
+      - "${MONGO_HOST_PORT:-27017}:27017"
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "-u", "${MONGO_USER}", "-p", "${MONGO_PASS}", "--authenticationDatabase", "admin", "--eval", "db.adminCommand('ping').ok"]
       interval: 15s
