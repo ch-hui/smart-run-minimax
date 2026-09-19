@@ -1,0 +1,60 @@
+# docker-compose.yml — MiniMax Anthropic demo + MongoDB
+#
+# All credentials and secrets are sourced from the sibling .env file
+# (which is gitignored). Copy .env.example to .env and fill in values
+# before running `docker compose up -d`.
+#
+# Data is persisted under ./data/mongo on the host.
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: minimax-demo-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:?MONGO_USER is required}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASS:?MONGO_PASS is required}
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-minimax_demo}
+    volumes:
+      # Persistent MongoDB data lives next to this docker-compose.yml,
+      # under ./data/mongo.
+      - ./data/mongo:/data/db
+      # Optional: seed scripts on first boot (skipped if dir is empty).
+      - ./mongo-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "-u", "${MONGO_USER}", "-p", "${MONGO_PASS}", "--authenticationDatabase", "admin", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - minimax-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: minimax-demo-app
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      # Anthropic SDK
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.minimax.cn/anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required}
+      MINIMAX_MODEL: ${MINIMAX_MODEL:-MiniMax-M3}
+      MAX_TOKENS: ${MAX_TOKENS:-1000}
+      # MongoDB — built from the same MONGO_USER/PASS/DB values
+      MONGO_URL: mongodb://${MONGO_USER}:${MONGO_PASS}@mongo:27017/${MONGO_DB:-minimax_demo}?authSource=admin
+      MONGO_DB: ${MONGO_DB:-minimax_demo}
+      MONGO_COLLECTION: ${MONGO_COLLECTION:-conversations}
+    ports:
+      # Host:container. Change the host port if 8000 is already taken.
+      - "${APP_PORT:-8000}:8000"
+    networks:
+      - minimax-net
+
+networks:
+  minimax-net:
+    driver: bridge

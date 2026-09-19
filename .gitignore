@@ -23,3 +23,7 @@ env/
 build/
 dist/
 *.egg-info/
+
+# Docker / runtime artefacts
+data/
+mongo-init/
