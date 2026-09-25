@@ -265,8 +265,8 @@ def root() -> dict:
             "POST /hello": '{"text": "your prompt"}',
             "GET  /hello": "?text=your+prompt",
             "GET  /history": "?limit=20",
-            "POST /race/analyze": '{"race_name": "2026南京马拉松"}',
-            "GET  /race/analyze": "?race_name=2026南京马拉松",
+            "POST /race/batch": '{"race_names": ["2026南京马拉松", "2026上海半马"]}',
+            "GET  /race/batch": "?race_names=A&race_names=B",
             "GET  /healthz": "liveness probe (also pings MongoDB)",
         },
     }
@@ -360,13 +360,18 @@ async def history(
     return {"count": len(items), "items": items}
 
 
+
 # ---------------------------------------------------------------------------
-# /race/analyze — structured race info via Anthropic tool use
+# /race/batch — concurrent structured race info via Anthropic tool use
 # ---------------------------------------------------------------------------
 #
-# We force the model to call a single tool with a strict JSON schema, then
-# surface the tool's input as the response. This guarantees the response
-# shape regardless of how the model phrased its prose.
+# The single-race /race/analyze endpoint is gone. Use /race/batch with a
+# list of race names; we dispatch them concurrently (asyncio.gather +
+# a semaphore-capped thread pool) so N races take ~max(per-call latency)
+# instead of N * latency.
+
+import asyncio
+import time
 
 RACE_TOOL_NAME = "submit_race_info"
 
@@ -461,14 +466,23 @@ RACE_SYSTEM_PROMPT = (
 )
 
 
-class RaceAnalysisRequest(BaseModel):
-    race_name: str = Field(..., min_length=1, max_length=200, description="比赛名称")
-    model: Optional[str] = Field(default=None, description="可选模型覆盖")
+class RaceBatchRequest(BaseModel):
+    race_names: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="1-20 race names to analyse concurrently",
+    )
+    model: Optional[str] = Field(default=None)
     max_tokens: Optional[int] = Field(default=None, ge=256, le=8000)
+    concurrency: Optional[int] = Field(
+        default=5, ge=1, le=10,
+        description="Max parallel upstream calls; clamped to len(race_names)",
+    )
 
 
-class RaceAnalysisResponse(BaseModel):
-    """Fixed response shape for /race/analyze."""
+class RaceItemResult(BaseModel):
+    """Per-race fixed-shape result. Identical to the previous single-race schema."""
 
     race_name: str
     race_date: Optional[str] = None
@@ -481,6 +495,19 @@ class RaceAnalysisResponse(BaseModel):
     confidence: str
     model: str
     usage: dict
+
+
+class RaceItemError(BaseModel):
+    race_name: str
+    error: str
+
+
+class RaceBatchResponse(BaseModel):
+    count: int
+    success: int
+    failed: int
+    elapsed_ms: int
+    results: list[RaceItemResult | RaceItemError]
 
 
 _DATE_FIELDS = ("race_date", "registration_start_date", "registration_end_date")
@@ -499,8 +526,6 @@ def _normalise_race_info(raw: dict[str, Any], race_name: str) -> dict[str, Any]:
         "summary": str(raw.get("summary") or "").strip(),
         "confidence": raw.get("confidence") or "low",
     }
-
-    # Validate ISO date strings; null out malformed entries instead of erroring.
     for field in _DATE_FIELDS:
         val = out[field]
         if val is None:
@@ -508,59 +533,43 @@ def _normalise_race_info(raw: dict[str, Any], race_name: str) -> dict[str, Any]:
         if not isinstance(val, str) or len(val) != 10 or val[4] != "-" or val[7] != "-":
             log.warning("model returned malformed %s=%r, normalising to null", field, val)
             out[field] = None
-
     if not out["tags"]:
         out["tags"] = ["未分类"]
     if not out["summary"]:
         out["summary"] = f"{out['race_name']} 相关信息有限，建议参考官方公告。"
     if out["confidence"] not in ("high", "medium", "low"):
         out["confidence"] = "low"
-
     return out
 
 
-def _analyze_race(race_name: str, model_override: Optional[str], max_tokens_override: Optional[int]) -> dict:
-    """Call MiniMax via tool use and return a normalised race-info dict."""
-    chosen_model = model_override or DEFAULT_MODEL
-    chosen_max_tokens = max_tokens_override or 1500
-    log.info("analyzing race=%r model=%s", race_name, chosen_model)
+def _call_race_one_sync(
+    race_name: str,
+    chosen_model: str,
+    chosen_max_tokens: int,
+) -> dict:
+    """Synchronous SDK call — invoked via asyncio.to_thread()."""
+    message = client.messages.create(
+        model=chosen_model,
+        max_tokens=chosen_max_tokens,
+        system=RACE_SYSTEM_PROMPT,
+        tools=[RACE_TOOL_SCHEMA],
+        tool_choice={"type": "tool", "name": RACE_TOOL_NAME},
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"请分析以下比赛并按 schema 返回结构化信息：\n\n{race_name}\n\n"
+                            "如果不确定某项事实，对应字段填 null，并把 confidence 设为 low。"
+                        ),
+                    }
+                ],
+            }
+        ],
+    )
 
-    try:
-        message = client.messages.create(
-            model=chosen_model,
-            max_tokens=chosen_max_tokens,
-            system=RACE_SYSTEM_PROMPT,
-            tools=[RACE_TOOL_SCHEMA],
-            tool_choice={"type": "tool", "name": RACE_TOOL_NAME},
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                f"请分析以下比赛并按 schema 返回结构化信息：\n\n{race_name}\n\n"
-                                "如果不确定某项事实，对应字段填 null，并把 confidence 设为 low。"
-                            ),
-                        }
-                    ],
-                }
-            ],
-        )
-    except anthropic.APIStatusError as exc:
-        log.error("race analyze upstream error: %s", exc)
-        raise HTTPException(
-            status_code=exc.status_code,
-            detail=f"MiniMax API error: {exc.message}",
-        ) from exc
-    except anthropic.APIConnectionError as exc:
-        log.error("race analyze connection error: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Connection error: {exc}") from exc
-    except anthropic.APIError as exc:
-        log.error("race analyze SDK error: %s", exc)
-        raise HTTPException(status_code=500, detail=f"SDK error: {exc}") from exc
-
-    # Find the tool_use block.
     tool_input: Optional[dict[str, Any]] = None
     for block in message.content:
         if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == RACE_TOOL_NAME:
@@ -568,12 +577,7 @@ def _analyze_race(race_name: str, model_override: Optional[str], max_tokens_over
             break
 
     if tool_input is None:
-        # Defensive: model refused or tool_choice was ignored. Surface as 502.
-        log.error("race analyze: model did not return tool_use. content=%s", message.content)
-        raise HTTPException(
-            status_code=502,
-            detail="Model did not return structured race info. Try again or shorten the race name.",
-        )
+        raise RuntimeError("model did not return submit_race_info tool_use")
 
     info = _normalise_race_info(tool_input, race_name)
     info["model"] = message.model
@@ -584,21 +588,109 @@ def _analyze_race(race_name: str, model_override: Optional[str], max_tokens_over
     return info
 
 
-@app.post("/race/analyze", response_model=RaceAnalysisResponse)
-async def race_analyze_post(req: RaceAnalysisRequest) -> RaceAnalysisResponse:
-    if not req.race_name.strip():
-        raise HTTPException(status_code=400, detail="'race_name' must not be empty")
-    info = _analyze_race(req.race_name, req.model, req.max_tokens)
-    return RaceAnalysisResponse(**info)
+async def _analyze_race_one(
+    race_name: str,
+    chosen_model: str,
+    chosen_max_tokens: int,
+    sem: asyncio.Semaphore,
+) -> RaceItemResult | RaceItemError:
+    """Analyse a single race. Catches all SDK errors so one failure does not
+    abort the whole batch."""
+    async with sem:
+        try:
+            info = await asyncio.to_thread(
+                _call_race_one_sync, race_name, chosen_model, chosen_max_tokens
+            )
+            return RaceItemResult(**info)
+        except anthropic.APIStatusError as exc:
+            return RaceItemError(race_name=race_name, error=f"upstream {exc.status_code}: {exc.message}")
+        except anthropic.APIConnectionError as exc:
+            return RaceItemError(race_name=race_name, error=f"connection: {exc}")
+        except anthropic.APIError as exc:
+            return RaceItemError(race_name=race_name, error=f"sdk: {exc}")
+        except Exception as exc:  # noqa: BLE001 — must not break the whole batch
+            log.exception("race analyze failed for %r", race_name)
+            return RaceItemError(race_name=race_name, error=str(exc))
 
 
-@app.get("/race/analyze", response_model=RaceAnalysisResponse)
-async def race_analyze_get(
-    race_name: str = Query(..., min_length=1, max_length=200, description="比赛名称"),
+async def _analyze_race_batch(
+    race_names: list[str],
+    model_override: Optional[str],
+    max_tokens_override: Optional[int],
+    concurrency: int,
+) -> RaceBatchResponse:
+    chosen_model = model_override or DEFAULT_MODEL
+    chosen_max_tokens = max_tokens_override or 1500
+    concurrency = max(1, min(concurrency, len(race_names)))
+
+    sem = asyncio.Semaphore(concurrency)
+    log.info(
+        "race batch: %d races, model=%s, concurrency=%d",
+        len(race_names), chosen_model, concurrency,
+    )
+
+    started = time.perf_counter()
+    results = await asyncio.gather(
+        *[
+            _analyze_race_one(name, chosen_model, chosen_max_tokens, sem)
+            for name in race_names
+        ]
+    )
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+    success = sum(1 for r in results if isinstance(r, RaceItemResult))
+    failed = len(results) - success
+    log.info("race batch done: %d success, %d failed in %dms", success, failed, elapsed_ms)
+
+    return RaceBatchResponse(
+        count=len(results),
+        success=success,
+        failed=failed,
+        elapsed_ms=elapsed_ms,
+        results=list(results),
+    )
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in items:
+        key = it.strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+@app.post("/race/batch", response_model=RaceBatchResponse)
+async def race_batch_post(req: RaceBatchRequest) -> RaceBatchResponse:
+    cleaned = _dedupe_preserve_order([n for n in req.race_names if n and n.strip()])
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="'race_names' must contain at least one non-empty entry")
+    return await _analyze_race_batch(
+        race_names=cleaned,
+        model_override=req.model,
+        max_tokens_override=req.max_tokens,
+        concurrency=req.concurrency or 5,
+    )
+
+
+@app.get("/race/batch", response_model=RaceBatchResponse)
+async def race_batch_get(
+    race_names: list[str] = Query(
+        ...,
+        description="Repeat ?race_names=A&race_names=B to pass multiple. URL-encode Chinese.",
+    ),
     model: Optional[str] = None,
     max_tokens: Optional[int] = Query(default=None, ge=256, le=8000),
-) -> RaceAnalysisResponse:
-    if not race_name.strip():
-        raise HTTPException(status_code=400, detail="query param 'race_name' must not be empty")
-    info = _analyze_race(race_name, model, max_tokens)
-    return RaceAnalysisResponse(**info)
+    concurrency: Optional[int] = Query(default=5, ge=1, le=10),
+) -> RaceBatchResponse:
+    cleaned = _dedupe_preserve_order([n for n in race_names if n and n.strip()])
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="query param 'race_names' must contain at least one non-empty entry")
+    return await _analyze_race_batch(
+        race_names=cleaned,
+        model_override=model,
+        max_tokens_override=max_tokens,
+        concurrency=concurrency or 5,
+    )

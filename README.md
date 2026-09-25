@@ -176,52 +176,82 @@ curl "http://localhost:8000/history?limit=10"
 - `GET /` — 服务基本信息（默认模型、base URL、mongo 状态、可用端点）
 - `GET /healthz` — 健康检查，同时探测 MongoDB 连接
 
-### `POST /race/analyze`
+### `POST /race/batch`
 
-传入比赛名称，返回**固定 schema** 的结构化 JSON（赛事日期、标签、置信度等）。
-底层用 Anthropic 的 `tool_use` + 严格 `input_schema` 强制模型按 schema 输出，保证响应形态稳定。
+并发批量分析比赛。一次请求传入 1–20 个赛事名，服务端用 `asyncio.gather` + 信号量控制并发度，把同步 SDK 调用丢进线程池执行，N 条 race 的总耗时约等于"最慢那条"的耗时，而不是 N× 单条耗时。
 
 请求体：
 
 ```json
 {
-  "race_name": "2026南京马拉松",
+  "race_names": ["2026南京马拉松", "2026上海半程马拉松", "2026北京马拉松"],
   "model": "MiniMax-M3",
-  "max_tokens": 1500
+  "max_tokens": 1500,
+  "concurrency": 5
 }
 ```
 
-固定响应 schema（`RaceAnalysisResponse`）：
+字段：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `race_names` | 是 | 1–20 个比赛名；空白和重复条目会被自动去重 |
+| `model` | 否 | 默认 `MINIMAX_MODEL` 环境变量 |
+| `max_tokens` | 否 | 默认 1500 |
+| `concurrency` | 否 | 1–10，默认 5；自动 clamp 到 `len(race_names)` |
+
+固定响应 schema（`RaceBatchResponse`）：
 
 ```json
 {
-  "race_name": "2026南京马拉松",
-  "race_date": "2026-03-15",
-  "registration_start_date": "2025-10-15",
-  "registration_end_date": "2025-11-30",
-  "location": "南京",
-  "distance_category": "full_marathon",
-  "tags": ["城市马拉松", "田协认证", "秋季赛事", "pb友好", "金牌赛事"],
-  "summary": "南京马拉松是华东地区具有较高知名度的城市马拉松赛事……",
-  "confidence": "medium",
-  "model": "MiniMax-M3",
-  "usage": {"input_tokens": 870, "output_tokens": 234}
+  "count": 3,
+  "success": 3,
+  "failed": 0,
+  "elapsed_ms": 3682,
+  "results": [
+    {
+      "race_name": "2026南京马拉松",
+      "race_date": "2026-11-29",
+      "registration_start_date": null,
+      "registration_end_date": null,
+      "location": "南京",
+      "distance_category": "full_marathon",
+      "tags": ["城市马拉松", "田协认证", "秋季赛事", "pb友好", "全马+半马"],
+      "summary": "……",
+      "confidence": "medium",
+      "model": "MiniMax-M3",
+      "usage": {"input_tokens": 102, "output_tokens": 226}
+    },
+    ...
+  ]
 }
 ```
+
+`results` 中每个元素要么是 `RaceItemResult`（成功的固定 schema），要么是 `RaceItemError`：
+
+```json
+{ "race_name": "某赛事", "error": "upstream 503: rate limit" }
+```
+
+一条 race 失败不会影响其他 race（并发独立执行，每条单独 try/except）。
 
 `distance_category` 取值：`full_marathon` / `half_marathon` / `10k` / `5k` / `trail` / `ultra` / `other`
 `confidence` 取值：`high` / `medium` / `low` —— 不确定的字段会设为 `null` 并把 `confidence` 降到 `low`，避免模型编造事实。
 
-### `GET /race/analyze`
+### `GET /race/batch`
 
 query string 形式（中文必须 URL encode）：
 
 ```bash
-curl --get "http://localhost:8000/race/analyze" \
-  --data-urlencode "race_name=2026上海半程马拉松"
+curl --get "http://localhost:8000/race/batch" \
+  --data-urlencode "race_names=2026武汉马拉松" \
+  --data-urlencode "race_names=2026杭州马拉松" \
+  --data-urlencode "concurrency=2"
 ```
 
 不编码的中文 query 会触发 HTTP 协议级错误（`Invalid HTTP request received`），这是 FastAPI/Starlette 拒绝处理非法 URL 的正常行为。
+
+> 历史说明：早期版本曾提供单条接口 `/race/analyze`，已删除，统一走批量接口以提升吞吐。
 
 ## MongoDB 凭证约定
 
