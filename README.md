@@ -176,6 +176,53 @@ curl "http://localhost:8000/history?limit=10"
 - `GET /` — 服务基本信息（默认模型、base URL、mongo 状态、可用端点）
 - `GET /healthz` — 健康检查，同时探测 MongoDB 连接
 
+### `POST /race/analyze`
+
+传入比赛名称，返回**固定 schema** 的结构化 JSON（赛事日期、标签、置信度等）。
+底层用 Anthropic 的 `tool_use` + 严格 `input_schema` 强制模型按 schema 输出，保证响应形态稳定。
+
+请求体：
+
+```json
+{
+  "race_name": "2026南京马拉松",
+  "model": "MiniMax-M3",
+  "max_tokens": 1500
+}
+```
+
+固定响应 schema（`RaceAnalysisResponse`）：
+
+```json
+{
+  "race_name": "2026南京马拉松",
+  "race_date": "2026-03-15",
+  "registration_start_date": "2025-10-15",
+  "registration_end_date": "2025-11-30",
+  "location": "南京",
+  "distance_category": "full_marathon",
+  "tags": ["城市马拉松", "田协认证", "秋季赛事", "pb友好", "金牌赛事"],
+  "summary": "南京马拉松是华东地区具有较高知名度的城市马拉松赛事……",
+  "confidence": "medium",
+  "model": "MiniMax-M3",
+  "usage": {"input_tokens": 870, "output_tokens": 234}
+}
+```
+
+`distance_category` 取值：`full_marathon` / `half_marathon` / `10k` / `5k` / `trail` / `ultra` / `other`
+`confidence` 取值：`high` / `medium` / `low` —— 不确定的字段会设为 `null` 并把 `confidence` 降到 `low`，避免模型编造事实。
+
+### `GET /race/analyze`
+
+query string 形式（中文必须 URL encode）：
+
+```bash
+curl --get "http://localhost:8000/race/analyze" \
+  --data-urlencode "race_name=2026上海半程马拉松"
+```
+
+不编码的中文 query 会触发 HTTP 协议级错误（`Invalid HTTP request received`），这是 FastAPI/Starlette 拒绝处理非法 URL 的正常行为。
+
 ## MongoDB 凭证约定
 
 为了符合"凭证不提交 git 仓库"的要求：
