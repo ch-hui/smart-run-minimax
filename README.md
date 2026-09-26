@@ -338,6 +338,75 @@ curl --get "http://localhost:8000/race/batch" \
 
 > 历史说明：早期版本曾提供单条接口 `/race/analyze`，已删除，统一走批量接口以提升吞吐。
 
+## race_analyses 持久化缓存
+
+`/race/batch` 的结果会自动写入 mongo 的 `race_analyses` 集合（key 是 `race_name`，unique index）。同一赛事后续查询直接读 mongo，**不打 Tavily、不调模型**——既快又省配额。
+
+**每条结果的 `source` 字段**告诉调用方本次响应是怎么来的：
+
+| `source` | 含义 |
+|---|---|
+| `manual` | 通过 `/race/correction` 人工录入的数据（最高优先级） |
+| `cache` | 自动模型生成的结果，本次从 mongo 缓存读取 |
+| `model` | 本次实时调用模型生成的（同时已写回 mongo，下次就成 `cache`） |
+
+实测：
+
+```
+Run 1（5 race 全 cache miss）：elapsed 11.2s，5 race 都调模型 + 搜索
+Run 2（同 5 race）：client wall 36ms，server elapsed 0ms，source 全 cache
+```
+
+### 适用场景
+
+- **重复查询**：同一赛事被前端批量 / 多次调用，节省所有下游成本
+- **数据稳定**：比赛日期、地点、tags、海拔不会变（除非组织方改路线），首次入库永久有效
+
+### `POST /race/correction`
+
+模型抓不到的数据（比如某些城市马的 elevation）允许人工录入：
+
+```bash
+curl -X POST http://localhost:8000/race/correction \
+  -H "Content-Type: application/json" \
+  -d '{
+    "race_name": "2026南京马拉松",
+    "elevation_gain_m": 82,
+    "max_elevation_m": 38,
+    "min_elevation_m": 8,
+    "elevation_profile": "整体非常平缓, 赛道沿玄武湖/明城墙/长江两岸",
+    "location": "南京",
+    "distance_category": "full_marathon",
+    "confidence": "high"
+  }'
+```
+
+成功响应：
+
+```json
+{ "ok": true, "race_name": "2026南京马拉松", "source": "manual", "updated_at": "..." }
+```
+
+下次 `/race/batch` 查这个赛事会直接返回 `source: "manual"`、零耗时。
+
+### `GET /race/cache`
+
+缓存状态：
+
+```bash
+curl http://localhost:8000/race/cache
+# {
+#   "healthy": true,
+#   "total": 5,
+#   "by_source": { "model": 4, "manual": 1 }
+# }
+```
+
+## 后续可扩展（未实现）
+
+- **图片解析海拔曲线**：比赛官网/公众号通常有「海拔曲线图」。思路：从搜索片段里识别图片 URL → 下载 → 调视觉模型解析成结构化高程数据。需要 MiniMax-M3 的 vision 能力确认 + 多模态调用实现。
+- **TTL 自动失效**：当前是永久缓存。如果路线改了，需要 `/race/correction` 覆盖（已经支持）或者加 `?force_refresh=true` 强制重生成。
+
 ## MongoDB 凭证约定
 
 为了符合"凭证不提交 git 仓库"的要求：
