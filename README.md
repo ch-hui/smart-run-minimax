@@ -323,3 +323,157 @@ python3 tests/test_mongo.py
 export MONGO_URL='mongodb://USER:PASS@host:27017/dbname?authSource=admin'
 python3 tests/test_mongo.py
 ```
+
+## 本地开发与测试
+
+完全在本机跑这套 stack，连接**已部署的远程 MongoDB**（不再依赖 docker）。
+
+### 1. 准备 venv + 依赖
+
+```bash
+cd smart-run-minimax        # 仓库根目录
+python3 -m venv .venv
+.venv/bin/python -m pip install -U pip
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+> ⚠️ **关键陷阱**：直接 `python3 -m uvicorn ...` 会用系统 python（macOS 上通常是 `/opt/anaconda3/bin/python3`），那个 python 没有装 `anthropic` 等依赖，进程会立即挂掉。**始终用绝对路径 `.venv/bin/python`** 或者先 `source .venv/bin/activate`。
+
+### 2. 配置 `.env`（最小化）
+
+复制模板并填值：
+
+```bash
+cp .env.example .env
+```
+
+`.env` 必填项：
+
+```env
+ANTHROPIC_BASE_URL=https://api.minimax.cn/anthropic
+ANTHROPIC_API_KEY=sk-cp-...                # 你的 MiniMax 订阅 key
+
+# 本地直接跑（不走 docker-compose）时，需要指向远程 mongo
+MONGO_URL=mongodb://minimax_admin:YOUR_PASS@47.121.29.106:27017/minimax_demo?authSource=admin
+MONGO_DB=minimax_demo
+MONGO_COLLECTION=conversations
+```
+
+> `app.py` 里 `load_dotenv(override=True)`，所以 shell 里如果预设了 `ANTHROPIC_BASE_URL=ikuncode` 这种旧值也不会影响启动。
+
+### 3. 启动服务
+
+```bash
+# 推荐：直接用绝对路径，不依赖 shell activate
+.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000
+
+# 或者用脚本
+.venv/bin/python run.sh       # 见底部说明
+```
+
+看到以下输出即启动成功：
+
+```
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+2026-09-25 10:28:15 INFO minimax-hello - MongoDB connected: db=minimax_demo ...
+```
+
+### 4. 烟测：根路径 + 健康检查
+
+```bash
+curl -s http://127.0.0.1:8000/ | python3 -m json.tool
+curl -s http://127.0.0.1:8000/healthz | python3 -m json.tool
+```
+
+`/healthz` 应该返回 `mongo.healthy: true`。
+
+### 5. `/hello` 接口
+
+```bash
+# POST (推荐)
+curl -s -X POST http://127.0.0.1:8000/hello \
+  -H "Content-Type: application/json" \
+  -d '{"text": "用一句话介绍你自己"}' | python3 -m json.tool
+
+# GET (中文必须 URL encode)
+curl -s --get http://127.0.0.1:8000/hello \
+  --data-urlencode "text=你好" | python3 -m json.tool
+```
+
+### 6. `/history` 接口
+
+```bash
+curl -s "http://127.0.0.1:8000/history?limit=5" | python3 -m json.tool
+```
+
+### 7. `/race/batch` 接口（并发批量）
+
+```bash
+# POST — 5 个赛事并发，~3.7s 完成
+curl -s -X POST http://127.0.0.1:8000/race/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "race_names": [
+      "2026南京马拉松",
+      "2026上海半程马拉松",
+      "2026北京马拉松",
+      "2026厦门马拉松",
+      "2026成都马拉松"
+    ],
+    "concurrency": 5
+  }' | python3 -m json.tool
+
+# GET — 中文必须 URL encode
+curl -s --get http://127.0.0.1:8000/race/batch \
+  --data-urlencode "race_names=2026武汉马拉松" \
+  --data-urlencode "race_names=2026杭州马拉松" \
+  --data-urlencode "concurrency=2" | python3 -m json.tool
+```
+
+返回里每个 `results[i]` 要么是完整 `RaceItemResult`，要么是 `{race_name, error}`。
+
+### 8. 一键回归脚本
+
+把下面所有调用打包跑一遍：
+
+```bash
+#!/usr/bin/env bash
+# 本地回归脚本：依次调每个接口，确认没有 5xx
+set -euo pipefail
+BASE="${BASE:-http://127.0.0.1:8000}"
+
+echo "1) /healthz"
+curl -fsS "$BASE/healthz" >/dev/null && echo "   OK"
+
+echo "2) POST /hello"
+curl -fsS -X POST "$BASE/hello" -H "Content-Type: application/json" \
+  -d '{"text":"smoke test"}' >/dev/null && echo "   OK"
+
+echo "3) GET /hello"
+curl -fsS --get "$BASE/hello" --data-urlencode "text=smoke" >/dev/null && echo "   OK"
+
+echo "4) GET /history?limit=1"
+curl -fsS "$BASE/history?limit=1" >/dev/null && echo "   OK"
+
+echo "5) POST /race/batch"
+curl -fsS -X POST "$BASE/race/batch" -H "Content-Type: application/json" \
+  -d '{"race_names":["2026南京马拉松","2026北京马拉松"],"concurrency":2}' >/dev/null \
+  && echo "   OK"
+
+echo
+echo "ALL GREEN ✓"
+```
+
+保存为 `scripts/smoke.sh`，`chmod +x` 后即可 `BASE=http://your-host:8000 ./scripts/smoke.sh`。
+
+### 9. 常见问题排查
+
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| `ModuleNotFoundError: anthropic` | 用系统 python 起的 uvicorn | 改用绝对路径 `.venv/bin/python` |
+| `Invalid HTTP request received` | GET 路径里中文没 URL encode | 用 `--data-urlencode` 或 `requests`/`urllib.parse.quote` |
+| `/healthz` 的 `mongo.healthy: false` | `.env` 里 `MONGO_URL` 缺失或密码错 | 检查 `.env`，或 `python3 tests/test_mongo.py` 直接验证 mongo 连通性 |
+| `/hello` 返回 401 | `ANTHROPIC_API_KEY` 缺失或无效 | 检查 `.env` 里的 key 是否过期 |
+| `/race/batch` 的 `failed` 字段非零 | 至少一条 race 的上游调用失败 | 查看 `results[i].error` 字段定位是限流还是网络 |
+```
