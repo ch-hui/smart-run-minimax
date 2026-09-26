@@ -62,6 +62,7 @@ WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() not in ("0"
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 WEB_SEARCH_TIMEOUT = float(os.getenv("WEB_SEARCH_TIMEOUT", "8"))
 WEB_SEARCH_CACHE_TTL = int(os.getenv("WEB_SEARCH_CACHE_TTL", "1800"))  # 30 min
+TAVILY_COOLDOWN_SECONDS = int(os.getenv("TAVILY_COOLDOWN_SECONDS", "3600"))  # 1 h after a quota hit
 
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "minimax_demo")
@@ -277,6 +278,7 @@ def root() -> dict:
             "collection": MONGO_COLLECTION,
             "healthy": mongo_state.healthy,
         },
+        "search": search_backend_status(),
         "endpoints": {
             "POST /hello": '{"text": "your prompt"}',
             "GET  /hello": "?text=your+prompt",
@@ -552,6 +554,14 @@ _DATE_FIELDS = ("race_date", "registration_start_date", "registration_end_date")
 _search_cache: dict[str, tuple[float, Optional[str]]] = {}
 _search_lock = threading.Lock()
 
+# Tavily quota protection — once we see a 429 / 402 we stop calling Tavily
+# for TAVILY_COOLDOWN_SECONDS to avoid burning the rest of the free tier on
+# requests that will all be rejected anyway. While disabled, _search_web
+# transparently falls back to DuckDuckGo HTML.
+_tavily_lock = threading.Lock()
+_tavily_disabled_until: float = 0.0
+_tavily_last_disabled_reason: str = ""
+
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
 
 
@@ -561,8 +571,26 @@ def _fetch_url(url: str, headers: dict[str, str], timeout: float) -> str:
         return r.read().decode("utf-8", errors="replace")
 
 
+def _tavily_in_cooldown() -> bool:
+    return time.time() < _tavily_disabled_until
+
+
+def _disable_tavily(reason: str) -> None:
+    """Mark Tavily as unavailable until now + TAVILY_COOLDOWN_SECONDS."""
+    global _tavily_disabled_until, _tavily_last_disabled_reason
+    with _tavily_lock:
+        _tavily_disabled_until = time.time() + TAVILY_COOLDOWN_SECONDS
+        _tavily_last_disabled_reason = reason
+
+
 def _search_tavily(query: str, max_results: int = 5) -> Optional[str]:
-    if not TAVILY_API_KEY:
+    """Synchronous Tavily Search API call.
+
+    Returns None on any failure (network, quota, parse). If a 429 / 402 is
+    observed, additionally marks Tavily as in cooldown so subsequent calls
+    skip it for TAVILY_COOLDOWN_SECONDS.
+    """
+    if not TAVILY_API_KEY or _tavily_in_cooldown():
         return None
     payload = json.dumps({
         "api_key": TAVILY_API_KEY,
@@ -571,20 +599,38 @@ def _search_tavily(query: str, max_results: int = 5) -> Optional[str]:
         "search_depth": "basic",
         "include_answer": False,
     }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": _UA},
+    )
     try:
-        raw = _fetch_url(
-            "https://api.tavily.com/search",
-            {"Content-Type": "application/json", "User-Agent": _UA},
-            WEB_SEARCH_TIMEOUT,
-        )
-        # NOTE: we POST via stdlib; use a Request with data=
-        req = urllib.request.Request(
-            "https://api.tavily.com/search",
-            data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": _UA},
-        )
         with urllib.request.urlopen(req, timeout=WEB_SEARCH_TIMEOUT) as r:
             data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # Treat 401 / 402 / 403 / 429 as "stop hammering Tavily":
+        #   401 = unauthorized (bad/expired key — same outcome either way)
+        #   402 = payment required (free-tier quota exhausted)
+        #   403 = forbidden (often used for quota on dev keys)
+        #   429 = rate limit
+        if exc.code in (401, 402, 403, 429):
+            retry_after = exc.headers.get("Retry-After")
+            try:
+                cooldown = int(retry_after) if retry_after else TAVILY_COOLDOWN_SECONDS
+            except ValueError:
+                cooldown = TAVILY_COOLDOWN_SECONDS
+            with _tavily_lock:
+                global _tavily_disabled_until, _tavily_last_disabled_reason
+                _tavily_disabled_until = time.time() + cooldown
+                _tavily_last_disabled_reason = f"HTTP {exc.code}"
+            log.warning(
+                "tavily quota/rate-limit/auth hit (HTTP %s) for %r; "
+                "disabling tavily for %ss, falling back to DDG",
+                exc.code, query, cooldown,
+            )
+        else:
+            log.warning("tavily search HTTP %s for %r: %s", exc.code, query, exc)
+        return None
     except Exception as exc:  # noqa: BLE001
         log.warning("tavily search failed for %r: %s", query, exc)
         return None
@@ -642,16 +688,39 @@ def _search_web(query: str) -> Optional[str]:
             return cached[1]
 
     snippets: Optional[str] = None
-    if TAVILY_API_KEY:
+    if TAVILY_API_KEY and not _tavily_in_cooldown():
         snippets = _search_tavily(query)
-        if not snippets:
-            log.info("tavily returned no results for %r, falling back to DDG", query)
+        if not snippets and _tavily_in_cooldown():
+            log.info("tavily entered cooldown after a quota hit; using DDG for %r", query)
+        elif not snippets:
+            log.info("tavily returned no snippets for %r, falling back to DDG", query)
+    elif TAVILY_API_KEY and _tavily_in_cooldown():
+        log.debug("tavily in cooldown (until +%ds); using DDG for %r",
+                  int(_tavily_disabled_until - time.time()), query)
     if not snippets:
         snippets = _search_duckduckgo(query)
 
     with _search_lock:
         _search_cache[query] = (now, snippets)
     return snippets
+
+
+def search_backend_status() -> dict[str, Any]:
+    """Return current search-backend state for /healthz and /."""
+    tavily_active = bool(TAVILY_API_KEY) and not _tavily_in_cooldown()
+    in_cooldown = bool(TAVILY_API_KEY) and _tavily_in_cooldown()
+    return {
+        "enabled": WEB_SEARCH_ENABLED,
+        "primary": "tavily" if TAVILY_API_KEY else "duckduckgo",
+        "fallback": "duckduckgo",
+        "tavily": {
+            "configured": bool(TAVILY_API_KEY),
+            "active": tavily_active,
+            "in_cooldown": in_cooldown,
+            "cooldown_remaining_sec": max(0, int(_tavily_disabled_until - time.time())),
+            "last_disabled_reason": _tavily_last_disabled_reason,
+        },
+    }
 
 
 def _normalise_race_info(raw: dict[str, Any], race_name: str) -> dict[str, Any]:

@@ -246,20 +246,23 @@ LLM 的训练知识有截止日期，对**近期赛事（报名期、比赛日�
 
 1. **服务端先搜**：每条 race 独立跑一次搜索，并发受 `_analyze_race_batch` 的 `concurrency` 控制。
 2. **两套搜索引擎**（按优先级）：
-   - **Tavily Search API**：要 `TAVILY_API_KEY`，专为 LLM 设计，输出干净。免费层每月 1000 次：[tavily.com](https://tavily.com)
+   - **Tavily Search API**（**默认**，只要 `.env` 里有 `TAVILY_API_KEY` 就走这条）：专为 LLM 设计，输出干净。免费层每月 1000 次：[tavily.com](https://tavily.com)
    - **DuckDuckGo HTML**：无需 key，直接抓 `html.duckduckgo.com/html/`，可作为兜底。**可能被限流**，生产建议配 Tavily
 3. **结果缓存**：同一 `race_name` 在 `WEB_SEARCH_CACHE_TTL` 秒内（默认 30 分钟）复用上一次搜索结果，避免重复打网络。
-4. **失败降级**：搜索返回 None / 超时 / 解析失败 → 该 race 静默退回纯 LLM 路径，`confidence` 自然会偏低，但**不影响响应**。
+4. **Tavily 配额保护**（重点）：
+   - 当 Tavily 返回 **401 / 402 / 403 / 429** 时，service 自动进入冷却期 `TAVILY_COOLDOWN_SECONDS` 秒（默认 3600s = 1h）
+   - 冷却期内 `_search_web` 静默跳过 Tavily，直接走 DDG——**不再消耗 Tavily 配额**
+   - 如果 Tavily 的 `Retry-After` header 有值，冷却时长取 header 值（≤1h）
+   - 通过 `GET /` 的 `search.tavily.{active, in_cooldown, cooldown_remaining_sec, last_disabled_reason}` 字段可观察当前状态
+5. **失败降级**：搜索返回 None / 超时 / 解析失败 → 该 race 静默退回纯 LLM 路径，`confidence` 自然会偏低，但**不影响响应**。
 
-实际验证：
+实际验证（用你的 `TAVILY_API_KEY`）：
 
-| 输入 | race_date | 季节标签 | confidence |
-|---|---|---|---|
-| 2026南京马拉松 | `2026-11-22` | 秋季赛事 ✓ | high |
-| 2026上海半程马拉松 | `2026-03-15` | 春季赛事 ✓ | high |
-| 2026北京马拉松 | `2026-10-18` | 秋季赛事 ✓ | high |
-| 2026厦门马拉松 | `2026-01-11` | 冬季赛事 ✓ | high |
-| 2026成都马拉松 | `2026-10-25` | 秋季赛事 ✓ | high |
+| 输入 | race_date | 季节标签 | confidence | 额外 |
+|---|---|---|---|---|
+| 2026南京马拉松 | `2026-11-22` | 秋季赛事 ✓ | high | 世界田联铜标 / A级赛事 / 历史文化 |
+| 2026上海半程马拉松 | `2026-03-15` | 春季赛事 ✓ | high | 田协认证 / 金标赛事 / 直通上马 / 上海地标 |
+| 2026北京马拉松 | `2026-10-18` | 秋季赛事 ✓ | high | IAAF金标赛事 / 全国马拉松锦标赛 / 国马 |
 
 关闭 web search：
 
@@ -268,6 +271,24 @@ WEB_SEARCH_ENABLED=false
 ```
 
 关闭后会回到纯模型模式，`/race/batch` 的 `race_date` 等字段很可能回到 null（除非模型确实记得）。
+
+观察 search 状态：
+
+```bash
+curl -s http://localhost:8000/ | jq .search
+# {
+#   "enabled": true,
+#   "primary": "tavily",
+#   "fallback": "duckduckgo",
+#   "tavily": {
+#     "configured": true,
+#     "active": true,
+#     "in_cooldown": false,
+#     "cooldown_remaining_sec": 0,
+#     "last_disabled_reason": ""
+#   }
+# }
+```
 
 ### `GET /race/batch`
 
