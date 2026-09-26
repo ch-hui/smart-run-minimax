@@ -90,12 +90,8 @@ class MongoState:
     client: Optional[AsyncIOMotorClient] = None
     db: Optional[AsyncIOMotorDatabase] = None
     collection: Optional[AsyncIOMotorCollection] = None
-    race_analyses: Optional[AsyncIOMotorCollection] = None
     healthy: bool = False
     last_error: Optional[str] = None
-
-
-RACE_ANALYSES_COLLECTION = os.getenv("RACE_ANALYSES_COLLECTION", "race_analyses")
 
 
 mongo_state = MongoState()
@@ -111,19 +107,9 @@ async def _connect_mongo() -> None:
         mongo_state.db = mongo_state.client[MONGO_DB]
         mongo_state.collection = mongo_state.db[MONGO_COLLECTION]
         await mongo_state.collection.create_index("created_at")
-
-        # race_analyses — cached structured race info keyed by race_name.
-        # Unique index lets us use upsert() without race conditions.
-        mongo_state.race_analyses = mongo_state.db[RACE_ANALYSES_COLLECTION]
-        await mongo_state.race_analyses.create_index("race_name", unique=True)
-        await mongo_state.race_analyses.create_index("updated_at")
-
         mongo_state.healthy = True
         mongo_state.last_error = None
-        log.info(
-            "MongoDB connected: db=%s collections=[%s, %s]",
-            MONGO_DB, MONGO_COLLECTION, RACE_ANALYSES_COLLECTION,
-        )
+        log.info("MongoDB connected: db=%s collection=%s", MONGO_DB, MONGO_COLLECTION)
     except Exception as exc:  # noqa: BLE001 — we want any connection error surfaced
         mongo_state.healthy = False
         mongo_state.last_error = str(exc)
@@ -533,12 +519,6 @@ class RaceItemResult(BaseModel):
     confidence: str
     model: str
     usage: dict
-    # Provenance: was this served from the cache or freshly generated?
-    # 'cache' = served from mongo, no model call; 'model' = freshly generated
-    # (and cached on the way back); 'manual' = served a record created via
-    # /race/correction.
-    source: str = "model"
-    cached_at: Optional[str] = None
 
 
 class RaceItemError(BaseModel):
@@ -841,7 +821,8 @@ async def _analyze_race_one(
     abort the whole batch."""
     async with sem:
         # Step 1: try to fetch real search snippets so the model answers from
-        # ground truth rather than stale training data.
+        # ground truth rather than stale training data. If search fails or
+        # returns nothing, we silently fall back to model-only mode.
         snippets: Optional[str] = None
         try:
             snippets = await asyncio.to_thread(_search_web, race_name)
@@ -857,8 +838,6 @@ async def _analyze_race_one(
                 chosen_max_tokens,
                 snippets,
             )
-            info["source"] = "model"
-            info["cached_at"] = None
             return RaceItemResult(**info)
         except anthropic.APIStatusError as exc:
             return RaceItemError(race_name=race_name, error=f"upstream {exc.status_code}: {exc.message}")
@@ -869,66 +848,6 @@ async def _analyze_race_one(
         except Exception as exc:  # noqa: BLE001 — must not break the whole batch
             log.exception("race analyze failed for %r", race_name)
             return RaceItemError(race_name=race_name, error=str(exc))
-
-
-async def _load_cached_analyses(race_names: list[str]) -> dict[str, dict[str, Any]]:
-    """Return race_name -> cached record dict from mongo, or {} if mongo unavailable."""
-    if not mongo_state.healthy or mongo_state.race_analyses is None:
-        return {}
-    try:
-        cursor = mongo_state.race_analyses.find({"race_name": {"$in": race_names}})
-        out: dict[str, dict[str, Any]] = {}
-        async for doc in cursor:
-            out[doc["race_name"]] = doc
-        return out
-    except Exception as exc:  # noqa: BLE001
-        log.warning("mongo cache load failed: %s", exc)
-        return {}
-
-
-async def _save_race_analysis(race_name: str, info: dict[str, Any], source: str) -> None:
-    """Upsert one race analysis to mongo. Silent on failure."""
-    if not mongo_state.healthy or mongo_state.race_analyses is None:
-        return
-    try:
-        now = datetime.now(timezone.utc)
-        doc = {**info, "race_name": race_name, "source": source, "updated_at": now}
-        doc.pop("cached_at", None)
-        doc.pop("_id", None)
-        await mongo_state.race_analyses.update_one(
-            {"race_name": race_name},
-            {"$set": doc, "$setOnInsert": {"created_at": now}},
-            upsert=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("mongo cache save failed for %r: %s", race_name, exc)
-
-
-def _cached_doc_to_result(doc: dict[str, Any]) -> RaceItemResult:
-    """Convert a stored mongo document into a RaceItemResult (drop mongo-only fields).
-
-    ``source`` reflects both provenance and freshness:
-      * 'manual'  — record was created via /race/correction (highest priority)
-      * 'cache'   — auto-generated model record, served from mongo (cache hit)
-    """
-    record_source = doc.get("source") or "cache"
-    effective_source = "manual" if record_source == "manual" else "cache"
-    out = {
-        "race_name": doc["race_name"],
-        "race_date": doc.get("race_date"),
-        "registration_start_date": doc.get("registration_start_date"),
-        "registration_end_date": doc.get("registration_end_date"),
-        "location": doc.get("location"),
-        "distance_category": doc.get("distance_category") or "other",
-        "tags": doc.get("tags") or ["未分类"],
-        "summary": doc.get("summary") or f"{doc['race_name']} 相关信息有限，建议参考官方公告。",
-        "confidence": doc.get("confidence") or "low",
-        "model": doc.get("model") or "cached",
-        "usage": doc.get("usage") or {"input_tokens": 0, "output_tokens": 0},
-        "source": effective_source,
-        "cached_at": doc["updated_at"].isoformat() if isinstance(doc.get("updated_at"), datetime) else None,
-    }
-    return RaceItemResult(**out)
 
 
 async def _analyze_race_batch(
@@ -947,58 +866,18 @@ async def _analyze_race_batch(
         len(race_names), chosen_model, concurrency,
     )
 
-    # Step 1: batch-load any cached records from mongo. Cache hit = zero Tavily
-    # calls, zero model calls, zero latency. This is the fast path for any
-    # race the user has previously queried (or that someone manually seeded
-    # via /race/correction).
-    cached = await _load_cached_analyses(race_names)
-    miss_names = [n for n in race_names if n not in cached]
-    log.info("race batch: %d cached, %d cache-miss (will query model)", len(cached), len(miss_names))
-
     started = time.perf_counter()
-
-    # Step 2: build cached results (preserving input order) and run the model
-    # for the misses in parallel.
-    cached_results: list[RaceItemResult | RaceItemError] = []
-    miss_results: list[RaceItemResult | RaceItemError] = []
-    if miss_names:
-        miss_results = await asyncio.gather(
-            *[_analyze_race_one(name, chosen_model, chosen_max_tokens, sem) for name in miss_names]
-        )
-
-    # Step 3: persist every successful fresh result to mongo so the next call
-    # hits the cache. Cache writes are best-effort; failure does not affect
-    # the response.
-    for name, res in zip(miss_names, miss_results):
-        if isinstance(res, RaceItemResult):
-            await _save_race_analysis(
-                name,
-                res.model_dump(exclude={"source", "cached_at"}),
-                source="model",
-            )
-
-    # Step 4: re-assemble in the original input order.
-    results_by_name: dict[str, RaceItemResult | RaceItemError] = {}
-    for name in race_names:
-        if name in cached:
-            try:
-                results_by_name[name] = _cached_doc_to_result(cached[name])
-            except Exception as exc:  # noqa: BLE001
-                log.warning("cached doc decode failed for %r: %s — falling through", name, exc)
-                results_by_name[name] = RaceItemError(race_name=name, error=f"cached doc decode failed: {exc}")
-    for name, res in zip(miss_names, miss_results):
-        results_by_name[name] = res
-
-    results = [results_by_name[n] for n in race_names]
+    results = await asyncio.gather(
+        *[
+            _analyze_race_one(name, chosen_model, chosen_max_tokens, sem)
+            for name in race_names
+        ]
+    )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
     success = sum(1 for r in results if isinstance(r, RaceItemResult))
     failed = len(results) - success
-    from_cache = sum(1 for r in results if isinstance(r, RaceItemResult) and r.source in ("cache", "manual"))
-    log.info(
-        "race batch done: %d success (%d from cache), %d failed in %dms",
-        success, from_cache, failed, elapsed_ms,
-    )
+    log.info("race batch done: %d success, %d failed in %dms", success, failed, elapsed_ms)
 
     return RaceBatchResponse(
         count=len(results),
@@ -1052,95 +931,3 @@ async def race_batch_get(
         max_tokens_override=max_tokens,
         concurrency=concurrency or 5,
     )
-
-
-# ---------------------------------------------------------------------------
-# /race/correction — manually seed or correct a cached analysis
-# ---------------------------------------------------------------------------
-#
-# Use this when the model returned wrong / null values for a race and you
-# have authoritative data from the official website, a printed brochure,
-# GPX file, or a Strava link. Future /race/batch calls will hit this
-# record straight from mongo with source='manual'.
-
-class RaceCorrectionRequest(BaseModel):
-    race_name: str = Field(..., min_length=1, max_length=200)
-    race_date: Optional[str] = None
-    registration_start_date: Optional[str] = None
-    registration_end_date: Optional[str] = None
-    location: Optional[str] = None
-    distance_category: Optional[str] = "other"
-    tags: Optional[list[str]] = None
-    summary: Optional[str] = None
-    confidence: Optional[str] = "high"
-
-
-def _validate_iso_date(value: Optional[str], field: str) -> Optional[str]:
-    if value is None:
-        return None
-    if not isinstance(value, str) or len(value) != 10 or value[4] != "-" or value[7] != "-":
-        raise HTTPException(status_code=400, detail=f"{field} must be ISO YYYY-MM-DD")
-    return value
-
-
-@app.post("/race/correction")
-async def race_correction(req: RaceCorrectionRequest) -> dict:
-    if not mongo_state.healthy or mongo_state.race_analyses is None:
-        raise HTTPException(status_code=503, detail=f"MongoDB unavailable: {mongo_state.last_error}")
-
-    distance_category = req.distance_category or "other"
-    if distance_category not in ("full_marathon", "half_marathon", "10k", "5k", "trail", "ultra", "other"):
-        raise HTTPException(status_code=400, detail=f"unknown distance_category: {distance_category}")
-
-    confidence = (req.confidence or "high").lower()
-    if confidence not in ("high", "medium", "low"):
-        raise HTTPException(status_code=400, detail=f"unknown confidence: {confidence}")
-
-    doc = {
-        "race_name": req.race_name,
-        "race_date": _validate_iso_date(req.race_date, "race_date"),
-        "registration_start_date": _validate_iso_date(req.registration_start_date, "registration_start_date"),
-        "registration_end_date": _validate_iso_date(req.registration_end_date, "registration_end_date"),
-        "location": req.location,
-        "distance_category": distance_category,
-        "tags": [t.strip() for t in (req.tags or []) if t and t.strip()][:12] or ["未分类"],
-        "summary": req.summary or f"{req.race_name} 人工录入数据。",
-        "confidence": confidence,
-        "model": "manual",
-        "usage": {"input_tokens": 0, "output_tokens": 0},
-        "source": "manual",
-    }
-
-    try:
-        now = datetime.now(timezone.utc)
-        await mongo_state.race_analyses.update_one(
-            {"race_name": req.race_name},
-            {"$set": {**doc, "updated_at": now}, "$setOnInsert": {"created_at": now}},
-            upsert=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"mongo upsert failed: {exc}") from exc
-
-    return {
-        "ok": True,
-        "race_name": req.race_name,
-        "source": "manual",
-        "updated_at": now.isoformat(),
-    }
-
-
-@app.get("/race/cache")
-async def race_cache_stats() -> dict:
-    """Show how many race_analyses are cached (for ops sanity checks)."""
-    if not mongo_state.healthy or mongo_state.race_analyses is None:
-        return {"healthy": False, "detail": mongo_state.last_error, "count": 0}
-    try:
-        total = await mongo_state.race_analyses.count_documents({})
-        by_source = {}
-        async for doc in mongo_state.race_analyses.aggregate([
-            {"$group": {"_id": "$source", "n": {"$sum": 1}}}
-        ]):
-            by_source[doc["_id"] or "unknown"] = doc["n"]
-        return {"healthy": True, "total": total, "by_source": by_source}
-    except Exception as exc:  # noqa: BLE001
-        return {"healthy": False, "detail": str(exc), "count": 0}
