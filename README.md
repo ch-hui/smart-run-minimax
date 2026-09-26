@@ -238,6 +238,37 @@ curl "http://localhost:8000/history?limit=10"
 `distance_category` 取值：`full_marathon` / `half_marathon` / `10k` / `5k` / `trail` / `ultra` / `other`
 `confidence` 取值：`high` / `medium` / `low` —— 不确定的字段会设为 `null` 并把 `confidence` 降到 `low`，避免模型编造事实。
 
+#### 数据来源：web search 兜底
+
+LLM 的训练知识有截止日期，对**近期赛事（报名期、比赛日期、季节标签、赛事认证等级）**几乎必然会编造或过时。为此 `/race/batch` 在调用模型前会**先做一次 web 搜索**，把真实片段塞进 prompt，让模型基于"搜索结果优先 + 自己知识次之"的策略回答。
+
+实现要点：
+
+1. **服务端先搜**：每条 race 独立跑一次搜索，并发受 `_analyze_race_batch` 的 `concurrency` 控制。
+2. **两套搜索引擎**（按优先级）：
+   - **Tavily Search API**：要 `TAVILY_API_KEY`，专为 LLM 设计，输出干净。免费层每月 1000 次：[tavily.com](https://tavily.com)
+   - **DuckDuckGo HTML**：无需 key，直接抓 `html.duckduckgo.com/html/`，可作为兜底。**可能被限流**，生产建议配 Tavily
+3. **结果缓存**：同一 `race_name` 在 `WEB_SEARCH_CACHE_TTL` 秒内（默认 30 分钟）复用上一次搜索结果，避免重复打网络。
+4. **失败降级**：搜索返回 None / 超时 / 解析失败 → 该 race 静默退回纯 LLM 路径，`confidence` 自然会偏低，但**不影响响应**。
+
+实际验证：
+
+| 输入 | race_date | 季节标签 | confidence |
+|---|---|---|---|
+| 2026南京马拉松 | `2026-11-22` | 秋季赛事 ✓ | high |
+| 2026上海半程马拉松 | `2026-03-15` | 春季赛事 ✓ | high |
+| 2026北京马拉松 | `2026-10-18` | 秋季赛事 ✓ | high |
+| 2026厦门马拉松 | `2026-01-11` | 冬季赛事 ✓ | high |
+| 2026成都马拉松 | `2026-10-25` | 秋季赛事 ✓ | high |
+
+关闭 web search：
+
+```env
+WEB_SEARCH_ENABLED=false
+```
+
+关闭后会回到纯模型模式，`/race/batch` 的 `race_date` 等字段很可能回到 null（除非模型确实记得）。
+
 ### `GET /race/batch`
 
 query string 形式（中文必须 URL encode）：
