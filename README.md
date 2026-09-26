@@ -218,10 +218,6 @@ curl "http://localhost:8000/history?limit=10"
       "distance_category": "full_marathon",
       "tags": ["城市马拉松", "田协认证", "秋季赛事", "pb友好", "全马+半马"],
       "summary": "……",
-      "elevation_gain_m": 120,
-      "max_elevation_m": 35,
-      "min_elevation_m": 12,
-      "elevation_profile": "整体平缓, 仅 35-38km 有持续缓坡",
       "confidence": "medium",
       "model": "MiniMax-M3",
       "usage": {"input_tokens": 102, "output_tokens": 226}
@@ -241,35 +237,6 @@ curl "http://localhost:8000/history?limit=10"
 
 `distance_category` 取值：`full_marathon` / `half_marathon` / `10k` / `5k` / `trail` / `ultra` / `other`
 `confidence` 取值：`high` / `medium` / `low` —— 不确定的字段会设为 `null` 并把 `confidence` 降到 `low`，避免模型编造事实。
-
-#### 高程/海拔字段（新增）
-
-响应里多了 4 个高程字段，用于查看海拔变化趋势：
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `elevation_gain_m` | `int \| null` | 全程累计爬升（米）。城市马拉松一般 50–200m，山地越野可达 2000–10000m+ |
-| `max_elevation_m` | `int \| null` | 赛道最高点海拔（米） |
-| `min_elevation_m` | `int \| null` | 赛道最低点海拔（米） |
-| `elevation_profile` | `string \| null` | 高程趋势的中文描述（≤200 字），如 "整体平缓" / "前 30km 起伏频繁, 后半程持续下降" |
-
-实现方式：
-
-- 在原有 race_name 搜索之外，**追加一次专门的高程搜索**：query = `"{race_name} 累计爬升 海拔 路线 elevation gain profile"`
-- 两个查询结果拼接后给模型，模型从中提炼 4 个字段
-- 数字字段在 `_normalise_race_info` 中做范围校验（-500m ~ 30000m），越界或非整数自动降级为 `null`
-- **4 个字段都是 required**：搜索片段没提到时模型必须填 `null`，绝不编造
-
-实测验证：
-
-| 赛事 | gain_m | profile | 备注 |
-|---|---|---|---|
-| 2026南京马拉松 | `null` | `null` | 城市马，搜索片段没提，模型正确不编造 |
-| 2026香港100越野赛 | 4744 | "赛道累计爬升约5000米，沿途起伏剧烈，翻越多座山头" | 山地越野 |
-| 2026宁海越野挑战赛 | 4986 | "UTNH-100组累计爬升/下降均为4986米..." | 越野，精确到组别 |
-| 2026柏林马拉松 | 74 | "赛道整体非常平坦...世界六大满贯中最平坦的赛道" | 海外平路 |
-
-> 说明：这是"摘要级"高程数据（总爬升 + 趋势描述），不是"逐公里海拔数组"。后者需要真实 GPS 轨迹 + Elevation API（Open-Elevation 免费 / Google 收费），属于另一条实现路径，不在本接口范围内。
 
 #### 数据来源：web search 兜底
 
@@ -360,23 +327,24 @@ Run 2（同 5 race）：client wall 36ms，server elapsed 0ms，source 全 cache
 ### 适用场景
 
 - **重复查询**：同一赛事被前端批量 / 多次调用，节省所有下游成本
-- **数据稳定**：比赛日期、地点、tags、海拔不会变（除非组织方改路线），首次入库永久有效
+- **数据稳定**：比赛日期、地点、tags 不会变（除非组织方改路线），首次入库永久有效
 
 ### `POST /race/correction`
 
-模型抓不到的数据（比如某些城市马的 elevation）允许人工录入：
+模型返回了错误或 null，而你手头有权威数据（官网、纸质手册、GPX 轨迹、Strava 链接等）时，用这个接口覆盖：
 
 ```bash
 curl -X POST http://localhost:8000/race/correction \
   -H "Content-Type: application/json" \
   -d '{
     "race_name": "2026南京马拉松",
-    "elevation_gain_m": 82,
-    "max_elevation_m": 38,
-    "min_elevation_m": 8,
-    "elevation_profile": "整体非常平缓, 赛道沿玄武湖/明城墙/长江两岸",
+    "race_date": "2026-11-22",
+    "registration_start_date": "2026-09-15",
+    "registration_end_date": "2026-10-31",
     "location": "南京",
     "distance_category": "full_marathon",
+    "tags": ["城市马拉松", "田协认证", "秋季赛事"],
+    "summary": "南京马拉松是华东地区知名城市马拉松...",
     "confidence": "high"
   }'
 ```
@@ -387,7 +355,20 @@ curl -X POST http://localhost:8000/race/correction \
 { "ok": true, "race_name": "2026南京马拉松", "source": "manual", "updated_at": "..." }
 ```
 
-下次 `/race/batch` 查这个赛事会直接返回 `source: "manual"`、零耗时。
+下次 `/race/batch` 查这个赛事会直接返回 `source: "manual"`、零耗时。所有字段（除了 `race_name`）都是可选的，**只传你想覆盖的部分**即可。
+
+### `GET /race/cache`
+
+缓存状态：
+
+```bash
+curl http://localhost:8000/race/cache
+# {
+#   "healthy": true,
+#   "total": 5,
+#   "by_source": { "model": 4, "manual": 1 }
+# }
+```
 
 ### `GET /race/cache`
 
@@ -404,7 +385,6 @@ curl http://localhost:8000/race/cache
 
 ## 后续可扩展（未实现）
 
-- **图片解析海拔曲线**：比赛官网/公众号通常有「海拔曲线图」。思路：从搜索片段里识别图片 URL → 下载 → 调视觉模型解析成结构化高程数据。需要 MiniMax-M3 的 vision 能力确认 + 多模态调用实现。
 - **TTL 自动失效**：当前是永久缓存。如果路线改了，需要 `/race/correction` 覆盖（已经支持）或者加 `?force_refresh=true` 强制重生成。
 
 ## MongoDB 凭证约定
