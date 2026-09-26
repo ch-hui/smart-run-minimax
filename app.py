@@ -443,6 +443,40 @@ RACE_TOOL_SCHEMA = {
                 "maxLength": 300,
                 "description": "One-sentence race description in Chinese.",
             },
+            "elevation_gain_m": {
+                "type": ["integer", "null"],
+                "description": (
+                    "Total cumulative elevation GAIN over the full course, in "
+                    "metres. Null if unknown. Typical values: flat city "
+                    "marathon ~50-200m, hilly road race ~500-1500m, trail/ultra "
+                    "race 2000-10000m+. Use the snippet-grounded value; do "
+                    "not invent."
+                ),
+            },
+            "max_elevation_m": {
+                "type": ["integer", "null"],
+                "description": (
+                    "Highest point on the course, in metres above sea level. "
+                    "Null if unknown."
+                ),
+            },
+            "min_elevation_m": {
+                "type": ["integer", "null"],
+                "description": (
+                    "Lowest point on the course, in metres above sea level. "
+                    "Null if unknown."
+                ),
+            },
+            "elevation_profile": {
+                "type": ["string", "null"],
+                "maxLength": 200,
+                "description": (
+                    "Short Chinese description of the elevation trend along "
+                    "the course, for example: 整体平缓, 仅 35-38km 有持续缓坡; "
+                    "前半程起伏频繁, 后半程持续下降; 全程陡峭爬升, 累计爬升超过 3000m. "
+                    "Null if no useful information is available."
+                ),
+            },
             "confidence": {
                 "type": "string",
                 "enum": ["high", "medium", "low"],
@@ -461,6 +495,10 @@ RACE_TOOL_SCHEMA = {
             "distance_category",
             "tags",
             "summary",
+            "elevation_gain_m",
+            "max_elevation_m",
+            "min_elevation_m",
+            "elevation_profile",
             "confidence",
         ],
     },
@@ -473,7 +511,7 @@ RACE_SYSTEM_PROMPT = (
     "web search snippets about that race. Your job:\n"
     "  1) Treat the search snippets as the GROUND TRUTH. When they mention "
     "specific dates, locations, distances, registration windows, "
-    "certifications, or seasons, use those exact values.\n"
+    "certifications, seasons, or elevation numbers, use those exact values.\n"
     "  2) If a fact is NOT in the snippets AND you are not certain about it, "
     "set the field to null and confidence to 'low'. Never guess.\n"
     "  3) For season tags (春季/夏季/秋季/冬季), infer from the race_date: "
@@ -485,6 +523,12 @@ RACE_SYSTEM_PROMPT = (
     "中国田径协会 / A1类赛事; '金牌赛事' / '银牌赛事' / '铜牌赛事' for IAAF/CAA tiers).\n"
     "  6) Summary must be one Chinese sentence (10-300 chars), factual, "
     "and may quote key details from the snippets.\n"
+    "  7) Elevation fields: extract total_gain_m / max / min if the snippets "
+    "mention numbers like '累计爬升' / '海拔' / '最高点' / '最低点' / 'total "
+    "elevation gain' / 'highest point'. For elevation_profile, write 1-2 "
+    "Chinese sentences describing the trend (flat / rolling / mountainous / "
+    "net descent / net ascent / where the hard parts are). If snippets give "
+    "no useful info, set all four to null.\n"
     "Always call the submit_race_info tool exactly once. When snippets are "
     "present, set confidence to 'high' for fields that match snippets verbatim."
 )
@@ -516,6 +560,10 @@ class RaceItemResult(BaseModel):
     distance_category: str
     tags: list[str]
     summary: str
+    elevation_gain_m: Optional[int] = None
+    max_elevation_m: Optional[int] = None
+    min_elevation_m: Optional[int] = None
+    elevation_profile: Optional[str] = None
     confidence: str
     model: str
     usage: dict
@@ -743,6 +791,33 @@ def _normalise_race_info(raw: dict[str, Any], race_name: str) -> dict[str, Any]:
         if not isinstance(val, str) or len(val) != 10 or val[4] != "-" or val[7] != "-":
             log.warning("model returned malformed %s=%r, normalising to null", field, val)
             out[field] = None
+
+    # Elevation fields: validate as non-negative integers in metres.
+    # Valid range covers Dead Sea (~-430m) to Everest summit (8848m),
+    # plus trail-race ascent (gain up to ~20000m cumulative).
+    for field in ("elevation_gain_m", "max_elevation_m", "min_elevation_m"):
+        val = raw.get(field)
+        if val is None:
+            out[field] = None
+            continue
+        try:
+            num = int(val)
+        except (TypeError, ValueError):
+            log.warning("model returned non-integer %s=%r, normalising to null", field, val)
+            out[field] = None
+            continue
+        if not (-500 <= num <= 30000):
+            log.warning("model returned out-of-range %s=%d, normalising to null", field, num)
+            out[field] = None
+            continue
+        out[field] = num
+
+    profile = raw.get("elevation_profile")
+    if isinstance(profile, str) and profile.strip():
+        out["elevation_profile"] = profile.strip()[:200]
+    else:
+        out["elevation_profile"] = None
+
     if not out["tags"]:
         out["tags"] = ["未分类"]
     if not out["summary"]:
@@ -821,11 +896,18 @@ async def _analyze_race_one(
     abort the whole batch."""
     async with sem:
         # Step 1: try to fetch real search snippets so the model answers from
-        # ground truth rather than stale training data. If search fails or
-        # returns nothing, we silently fall back to model-only mode.
+        # ground truth rather than stale training data. We do two searches:
+        # one for the basic race info and one specifically for elevation /
+        # course profile. Both are cached internally so repeat calls in the
+        # same batch are cheap.
         snippets: Optional[str] = None
         try:
-            snippets = await asyncio.to_thread(_search_web, race_name)
+            base, elev = await asyncio.gather(
+                asyncio.to_thread(_search_web, race_name),
+                asyncio.to_thread(_search_web, f"{race_name} 累计爬升 海拔 路线 elevation gain profile"),
+            )
+            parts = [s for s in (base, elev) if s]
+            snippets = "\n\n".join(parts) if parts else None
         except Exception as exc:  # noqa: BLE001
             log.warning("search failed for %r: %s", race_name, exc)
 
